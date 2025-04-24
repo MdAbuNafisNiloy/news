@@ -1,0 +1,689 @@
+<?php
+// Start session for user authentication
+session_start();
+
+// Include database and configuration files
+require_once 'config/database.php';
+require_once 'config/config.php';
+require_once 'includes/functions.php'; // Assuming generateSlug, logActivity etc. are here
+require_once 'includes/auth.php';    // Assuming isLoggedIn, hasPermission, getCurrentUser etc. are here
+
+// --- Get Article ID and Initial Data Fetch ---
+$articleId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+if ($articleId <= 0) {
+    header("Location: articles.php?message=Invalid article ID.&type=danger");
+    exit();
+}
+
+$article = null;
+$message = '';
+$messageType = '';
+$uploadPath = ''; // To store path if needed outside try block
+
+try {
+    // Fetch article data
+    $stmt = $db->prepare("SELECT a.*, u.username as author_name
+                          FROM articles a
+                          LEFT JOIN users u ON a.author_id = u.id
+                          WHERE a.id = ?");
+    $stmt->execute([$articleId]);
+    $article = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$article) {
+        header("Location: articles.php?message=Article not found.&type=danger");
+        exit();
+    }
+
+    // --- Permission Check ---
+    $canEditAny = hasPermission('edit_any_article');
+    $canEditOwn = hasPermission('edit_own_article');
+    $isOwnArticle = ($article['author_id'] == $_SESSION['user_id']); // Assuming user_id is stored in session
+
+    if (!($canEditAny || ($canEditOwn && $isOwnArticle))) {
+         header("Location: articles.php?message=You do not have permission to edit this article.&type=danger");
+         exit();
+    }
+
+    // Fetch selected categories
+    $catStmt = $db->prepare("SELECT category_id FROM article_categories WHERE article_id = ?");
+    $catStmt->execute([$articleId]);
+    $article['selected_categories'] = $catStmt->fetchAll(PDO::FETCH_COLUMN);
+
+    // Fetch selected tags
+    $tagStmt = $db->prepare("SELECT tag_id FROM article_tags WHERE article_id = ?");
+    $tagStmt->execute([$articleId]);
+    $article['selected_tags'] = $tagStmt->fetchAll(PDO::FETCH_COLUMN);
+
+    // Get all available categories/tags for the form
+    $categoriesStmt = $db->query("SELECT id, name FROM categories ORDER BY name");
+    $categories = $categoriesStmt->fetchAll(PDO::FETCH_ASSOC);
+    $tagsStmt = $db->query("SELECT id, name FROM tags ORDER BY name");
+    $tags = $tagsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+    $message = "Error loading article data: " . $e->getMessage();
+    $messageType = "danger";
+    error_log("Article Load Error (ID: $articleId): " . $e->getMessage());
+    // Display error on page, don't exit yet so user sees message
+    $article = null; // Prevent form rendering if load failed badly
+}
+
+// --- Process Form Submission (Update) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $article) { // Only process if article was loaded successfully
+    // Store original data for comparison/deletion
+    $originalSlug = $article['slug'];
+    $originalFeaturedImage = $article['featured_image'];
+
+    // Get data from POST, similar to create page, default to original article data
+    $submittedData = [
+        'title' => $_POST['title'] ?? $article['title'],
+        'slug' => $_POST['slug'] ?? $article['slug'],
+        'content' => $_POST['content'] ?? $article['content'], // Raw content from editor
+        'excerpt' => $_POST['excerpt'] ?? $article['excerpt'],
+        'status' => $_POST['status'] ?? $article['status'],
+        'visibility' => $_POST['visibility'] ?? $article['visibility'],
+        'password' => $_POST['password'] ?? $article['password'],
+        'featured' => isset($_POST['featured']) ? 1 : 0,
+        'breaking_news' => isset($_POST['breaking_news']) ? 1 : 0,
+        'selected_categories' => isset($_POST['categories']) && is_array($_POST['categories']) ? $_POST['categories'] : [],
+        'selected_tags' => isset($_POST['tags']) && is_array($_POST['tags']) ? $_POST['tags'] : []
+    ];
+    // Update the $article array immediately for form repopulation on error
+    $article = array_merge($article, $submittedData);
+
+    try {
+        // --- Input Validation ---
+        if (empty($submittedData['title'])) throw new Exception("Article title is required.");
+        if (empty($submittedData['content']) || $submittedData['content'] === '<p><br></p>') throw new Exception("Article content cannot be empty.");
+        if ($submittedData['visibility'] === 'password_protected' && empty($submittedData['password'])) throw new Exception("Password is required for password-protected visibility.");
+
+        // Sanitize inputs
+        $title = sanitizeInput($submittedData['title']);
+        $slug = sanitizeInput($submittedData['slug']);
+        $content = $submittedData['content'];
+        $excerpt = sanitizeInput($submittedData['excerpt']);
+        $status = sanitizeInput($submittedData['status']);
+        $visibility = sanitizeInput($submittedData['visibility']);
+        $password = $visibility === 'password_protected' ? trim($submittedData['password']) : '';
+        $featured = $submittedData['featured'];
+        $breaking_news = $submittedData['breaking_news'];
+        $selectedCategories = array_map('intval', $submittedData['selected_categories']);
+        $selectedTags = array_map('intval', $submittedData['selected_tags']);
+
+        // Auto-generate slug if empty
+        if (empty($slug)) {
+            $slug = generateSlug($title);
+            if (empty($slug)) throw new Exception("Could not generate slug from title.");
+        }
+
+        // Check slug uniqueness IF it changed or was submitted
+        if ($slug !== $originalSlug) {
+            $uniqueSlug = $slug;
+            $counter = 1;
+            while (true) {
+                $stmt = $db->prepare("SELECT COUNT(*) FROM articles WHERE slug = ? AND id != ?");
+                $stmt->execute([$uniqueSlug, $articleId]);
+                if ($stmt->fetchColumn() == 0) {
+                    $slug = $uniqueSlug; // Use the unique slug
+                    break;
+                }
+                $uniqueSlug = $slug . '-' . $counter++;
+                if ($counter > 10) throw new Exception("Could not generate a unique slug after multiple attempts.");
+            }
+            $article['slug'] = $slug; // Update for potential repopulation
+        }
+
+        // --- Featured Image Update Handling ---
+        $featuredImagePath = $originalFeaturedImage; // Start with the original path
+        $newImageUploaded = false;
+        if (isset($_FILES['featured_image']) && $_FILES['featured_image']['error'] === UPLOAD_ERR_OK) {
+            $fileTmpPath = $_FILES['featured_image']['tmp_name'];
+            $fileName = $_FILES['featured_image']['name'];
+            $fileSize = $_FILES['featured_image']['size'];
+            $fileInfo = pathinfo($fileName);
+            $extension = strtolower($fileInfo['extension']);
+            $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+
+            if (!in_array($extension, $allowedExtensions)) throw new Exception("Invalid image format. Allowed: JPG, JPEG, PNG, GIF, WEBP");
+            if ($fileSize > 5 * 1024 * 1024) throw new Exception("Image size too large (Max 5MB).");
+
+            $safeSlugPart = substr(preg_replace('/[^a-z0-9]+/', '-', strtolower($title)), 0, 30);
+            $newFilename = 'article_' . $articleId . '_' . trim($safeSlugPart, '-') . '-' . uniqid() . '.' . $extension;
+            $uploadDir = 'uploads/articles/';
+            $uploadPath = $uploadDir . $newFilename; // Store new path
+
+            if (!is_dir($uploadDir)) { if (!mkdir($uploadDir, 0755, true)) throw new Exception("Failed to create upload directory."); }
+            if (!move_uploaded_file($fileTmpPath, $uploadPath)) throw new Exception("Failed to move uploaded image.");
+
+            $featuredImagePath = $uploadPath; // Set path for DB update to the NEW path
+            $newImageUploaded = true;
+        }
+
+        // Handle potential image removal request (Add a checkbox in the form if needed)
+        // if (isset($_POST['remove_featured_image']) && $_POST['remove_featured_image'] == '1') {
+        //     $featuredImagePath = null; // Set to null in DB
+        //     // Delete old file if it exists
+        //     if ($originalFeaturedImage && file_exists($originalFeaturedImage)) {
+        //         unlink($originalFeaturedImage);
+        //     }
+        // }
+
+        // --- Database Update Operations ---
+        $db->beginTransaction();
+
+        // 1. Update Article Core Data
+        $sql = "UPDATE articles SET
+                    title = :title, slug = :slug, content = :content, excerpt = :excerpt,
+                    status = :status, visibility = :visibility, password = :password,
+                    featured = :featured, breaking_news = :breaking_news, featured_image = :featured_image,
+                    updated_at = NOW(), published_at = :published_at
+                WHERE id = :id";
+        $stmt = $db->prepare($sql);
+
+        // Determine published_at - set only if status changes to 'published' AND user has perm
+        $publishedAt = $article['published_at']; // Keep original by default
+        if ($status === 'published' && $article['status'] !== 'published' && hasPermission('publish_article')) {
+            $publishedAt = date('Y-m-d H:i:s');
+        } elseif ($status !== 'published') {
+            $publishedAt = null; // Clear published date if moved back to draft/pending
+        }
+
+        $stmt->execute([
+            ':title' => $title,
+            ':slug' => $slug,
+            ':content' => $content,
+            ':excerpt' => $excerpt,
+            ':status' => $status,
+            ':visibility' => $visibility,
+            ':password' => $password ?: null,
+            ':featured' => $featured,
+            ':breaking_news' => $breaking_news,
+            ':featured_image' => $featuredImagePath, // Use the determined path (new or original)
+            ':published_at' => $publishedAt,
+            ':id' => $articleId
+        ]);
+
+        // 2. Update Categories (Delete existing, then insert new)
+        $delCatStmt = $db->prepare("DELETE FROM article_categories WHERE article_id = ?");
+        $delCatStmt->execute([$articleId]);
+        if (!empty($selectedCategories)) {
+            $catSql = "INSERT INTO article_categories (article_id, category_id) VALUES (:article_id, :category_id)";
+            $catStmt = $db->prepare($catSql);
+            foreach ($selectedCategories as $categoryId) {
+                $catStmt->execute([':article_id' => $articleId, ':category_id' => $categoryId]);
+            }
+        }
+
+        // 3. Update Tags (Delete existing, then insert new)
+        $delTagStmt = $db->prepare("DELETE FROM article_tags WHERE article_id = ?");
+        $delTagStmt->execute([$articleId]);
+        if (!empty($selectedTags)) {
+            $tagSql = "INSERT INTO article_tags (article_id, tag_id) VALUES (:article_id, :tag_id)";
+            $tagStmt = $db->prepare($tagSql);
+            foreach ($selectedTags as $tagId) {
+                $tagStmt->execute([':article_id' => $articleId, ':tag_id' => $tagId]);
+            }
+        }
+
+        // Commit transaction
+        $db->commit();
+
+        // Delete old featured image *after* successful commit if a new one was uploaded
+        if ($newImageUploaded && $originalFeaturedImage && $originalFeaturedImage !== $featuredImagePath && file_exists($originalFeaturedImage)) {
+            unlink($originalFeaturedImage);
+        }
+
+        // Log activity
+        logActivity($_SESSION['user_id'], 'article_update', 'articles', $articleId, 'Updated article: "' . $title . '"');
+        if ($publishedAt && $publishedAt == date('Y-m-d H:i:s')) { // Check if just published
+             logActivity($_SESSION['user_id'], 'article_publish', 'articles', $articleId, 'Published article: "' . $title . '"');
+        }
+
+        $message = "Article updated successfully!";
+        $messageType = "success";
+
+        // --- Redirect based on button pressed ---
+        if (isset($_POST['save_and_continue'])) {
+            // Redirect back to edit page with success message
+            header("Location: article-edit.php?id=$articleId&message=" . urlencode($message) . "&type=" . $messageType); exit();
+        }
+        if (isset($_POST['save_and_new'])) {
+             header("Location: article-new.php?message=" . urlencode($message) . "&type=" . $messageType); exit();
+        }
+        // Default redirect (Update or Update & Publish)
+        header("Location: articles.php?message=" . urlencode($message) . "&type=" . $messageType); exit();
+
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        // Delete newly uploaded file if transaction failed
+        if ($newImageUploaded && !empty($uploadPath) && file_exists($uploadPath)) {
+            unlink($uploadPath);
+        }
+        $message = "Error: " . $e->getMessage();
+        $messageType = "danger";
+        error_log("Article Update Error (ID: $articleId): " . $e->getMessage());
+        // $article array is already updated with submitted data for repopulation
+    }
+}
+
+// Get user information (needed for header even if form processing fails)
+$currentUser = getCurrentUser();
+// Get header UTC time (use fixed value provided)
+$headerUtcTime = '2025-04-20 04:56:16';
+
+// Check for messages passed via URL (e.g., after 'Save & Continue')
+if (isset($_GET['message']) && isset($_GET['type'])) {
+    $message = urldecode($_GET['message']);
+    $messageType = urldecode($_GET['type']);
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edit Article - <?php echo $article ? htmlspecialchars($article['title']) : 'Error'; ?> - <?php echo htmlspecialchars(SITE_NAME); ?></title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" integrity="sha512-SnH5WK+bZxgPHs44uWIX+LLJAJ9/2PkPKZ5QiAj6Ta86w+fsb2TkcmfRyVX3pBnMFcV7oQPJkl9QevSCWr3W6A==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Quill.js CSS -->
+    <link href="https://cdn.quilljs.com/1.3.7/quill.snow.css" rel="stylesheet">
+    <style>
+        /* --- Same CSS as article-new.php --- */
+        :root {
+            --primary-color: #4e73df;
+            --secondary-color: #1cc88a;
+            --danger-color: #e74a3b;
+            --warning-color: #f6c23e;
+            --info-color: #36b9cc;
+            --dark-color: #5a5c69;
+            --light-color: #f8f9fc;
+            --sidebar-width: 220px;
+            --sidebar-width-collapsed: 90px;
+        }
+        body { font-family: 'Poppins', sans-serif; background-color: var(--light-color); color: var(--dark-color); overflow-x: hidden; }
+
+        /* Sidebar */
+        .sidebar { background: linear-gradient(180deg, var(--primary-color) 10%, #224abe 100%); height: 100vh; position: fixed; top: 0; left: 0; z-index: 1030; width: var(--sidebar-width); transition: width 0.3s ease-in-out; overflow-y: auto; overflow-x: hidden; }
+        .sidebar.collapsed { width: var(--sidebar-width-collapsed); text-align: center; }
+        .sidebar.collapsed .sidebar-brand { padding: 1.5rem 0.5rem; font-size: 0.8rem; }
+        .sidebar.collapsed .sidebar-brand span { display: none; }
+        .sidebar.collapsed .sidebar-item { padding: 0.75rem; justify-content: center; }
+        .sidebar.collapsed .sidebar-item i { margin-right: 0; }
+        .sidebar.collapsed .sidebar-item span { display: none; }
+        .sidebar-brand { height: 4.375rem; padding: 1.5rem 1rem; color: #fff; text-align: center; font-size: 1.1rem; font-weight: 700; letter-spacing: 0.05rem; text-transform: uppercase; border-bottom: 1px solid rgba(255, 255, 255, 0.15); text-decoration: none; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sidebar-brand i { vertical-align: middle; }
+        .sidebar-items { margin-top: 1rem; }
+        .sidebar-item { padding: 0.75rem 1rem; color: rgba(255, 255, 255, 0.8); transition: background-color 0.2s, color 0.2s; display: flex; align-items: center; margin: 0.25rem 0.5rem; border-radius: 0.35rem; text-decoration: none; white-space: nowrap; }
+        .sidebar-item.active, .sidebar-item:hover { background-color: rgba(255, 255, 255, 0.1); color: #fff; }
+        .sidebar-item i { margin-right: 0.75rem; opacity: 0.8; width: 1.25em; text-align: center; flex-shrink: 0; }
+
+        /* Main Content */
+        .main-content { padding: 1.5rem; margin-left: var(--sidebar-width); transition: margin-left 0.3s ease-in-out; }
+        .main-content.expanded { margin-left: var(--sidebar-width-collapsed); }
+
+        /* Top Bar */
+        .top-bar { background: #fff; margin-bottom: 1.5rem; padding: 0.75rem 1rem; border-radius: 0.35rem; box-shadow: 0 0.1rem 1rem 0 rgba(58, 59, 69, 0.1); display: flex; justify-content: space-between; align-items: center; }
+        .top-bar .dropdown-toggle::after { display: none; }
+
+        /* Cards */
+        .card { border: none; border-radius: 0.35rem; box-shadow: 0 0.1rem 1rem 0 rgba(58, 59, 69, 0.08); margin-bottom: 1.5rem; overflow: hidden; }
+        .card-header { background-color: #fdfdfd; border-bottom: 1px solid #e3e6f0; padding: 0.75rem 1rem; font-weight: 600; color: var(--primary-color); }
+        .card-header h5 { font-size: 1rem; margin-bottom: 0; }
+        .card-body { padding: 1rem; }
+        .card-footer { background-color: #fdfdfd; border-top: 1px solid #e3e6f0; padding: 0.75rem 1rem; }
+
+        /* Forms */
+        .form-label { font-weight: 500; margin-bottom: 0.3rem; font-size: 0.9rem; }
+        .form-text { font-size: 0.75rem; }
+        .form-control, .form-select { font-size: 0.9rem; }
+        .form-control-sm, .form-select-sm { font-size: 0.8rem; }
+
+        /* Header */
+        .page-header { background: linear-gradient(to right, var(--primary-color), #224abe); color: white; padding: 1.5rem; border-radius: 0.35rem; margin-bottom: 1.5rem; position: relative; overflow: hidden; }
+        .page-header h2 { font-weight: 600; margin-bottom: 0.25rem; font-size: 1.5rem; }
+        .page-header p { opacity: 0.9; margin-bottom: 0; font-size: 0.9rem; }
+        .header-meta { font-size: 0.75rem; opacity: 0.8; text-align: right; margin-top: 1rem; }
+
+        /* Quill Editor */
+        #editor-container { height: 350px; margin-bottom: 0.5rem; background-color: #fff; }
+        .ql-toolbar.ql-snow { border-top-left-radius: 0.35rem; border-top-right-radius: 0.35rem; border-color: #d1d3e2; background-color: #f8f9fc; padding: 8px; }
+        .ql-container.ql-snow { border-bottom-left-radius: 0.35rem; border-bottom-right-radius: 0.35rem; border-color: #d1d3e2; font-size: 1rem; }
+        .ql-editor { line-height: 1.6; }
+        .ql-editor p, .ql-editor li { font-size: 1rem; }
+
+        /* Sidebar Column */
+        .publish-card .action-buttons { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #e3e6f0; }
+        .visibility-options { display: none; margin-top: 0.5rem; padding-left: 0.5rem; border-left: 3px solid #eee; }
+        .visibility-options.show { display: block; }
+        .preview-img-container { margin-top: 0.75rem; }
+        .preview-img { max-width: 100%; height: auto; max-height: 150px; border-radius: 0.25rem; display: block; border: 1px solid #eee; margin-bottom: 0.5rem; }
+        .current-img-label { font-size: 0.75rem; color: #666; display: block; margin-bottom: 0.5rem; }
+        .multi-select-container { max-height: 150px; overflow-y: auto; border: 1px solid #eee; padding: 0.5rem; border-radius: 0.25rem; }
+
+        /* Responsive */
+        @media (max-width: 992px) { .main-content { padding: 1rem; } .page-header { padding: 1rem; } .page-header h2 { font-size: 1.3rem; } .header-meta { text-align: left; margin-top: 0.5rem; } }
+        @media (max-width: 768px) { .main-content { padding: 0.75rem; } .top-bar .dropdown span { display: none; } #editor-container { height: 300px; } }
+    </style>
+</head>
+<body>
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <a href="index.php" class="sidebar-brand" title="<?php echo htmlspecialchars(SITE_NAME); ?>">
+            <i class="fas fa-newspaper fa-fw"></i> <span><?php echo htmlspecialchars(SITE_NAME); ?></span>
+        </a>
+        <div class="sidebar-items">
+            <a href="index.php" class="sidebar-item" title="Dashboard"> <i class="fas fa-tachometer-alt fa-fw"></i> <span>Dashboard</span> </a>
+            <?php if (hasPermission('create_article')): ?> <a href="articles.php" class="sidebar-item active" title="Articles"> <i class="fas fa-newspaper fa-fw"></i> <span>Articles</span> </a> <?php endif; ?>
+            <?php if (hasPermission('manage_categories')): ?> <a href="categories.php" class="sidebar-item" title="Categories"> <i class="fas fa-folder fa-fw"></i> <span>Categories</span> </a> <?php endif; ?>
+			<?php if (hasPermission('manage_categories')): // Add this permission check ?>
+            <a href="pages.php" class="sidebar-item <?php echo (basename($_SERVER['PHP_SELF']) == 'pages.php' || basename($_SERVER['PHP_SELF']) == 'page-edit.php') ? 'active' : ''; ?>" title="Pages">
+                <i class="fas fa-file-alt fa-fw"></i> <span>Pages</span>
+            </a>
+            <?php endif; ?>
+            <?php if (hasPermission('manage_comments')): ?> <a href="comments.php" class="sidebar-item" title="Comments"> <i class="fas fa-comments fa-fw"></i> <span>Comments</span> </a> <?php endif; ?>
+            <?php if (hasPermission('manage_users')): ?> <a href="users.php" class="sidebar-item" title="Users"> <i class="fas fa-users fa-fw"></i> <span>Users</span> </a> <?php endif; ?>
+            <?php if (hasPermission('manage_roles')): ?> <a href="roles.php" class="sidebar-item" title="Roles"> <i class="fas fa-user-tag fa-fw"></i> <span>Roles</span> </a> <?php endif; ?>
+            <a href="media.php" class="sidebar-item" title="Media"> <i class="fas fa-images fa-fw"></i> <span>Media</span> </a>
+            <?php if (hasPermission('manage_settings')): ?> <a href="settings.php" class="sidebar-item" title="Settings"> <i class="fas fa-cog fa-fw"></i> <span>Settings</span> </a> <?php endif; ?>
+            <hr class="text-white-50 mx-3 my-2">
+            <a href="profile.php" class="sidebar-item" title="Profile"> <i class="fas fa-user-circle fa-fw"></i> <span>Profile</span> </a>
+            <a href="logout.php" class="sidebar-item" title="Logout"> <i class="fas fa-sign-out-alt fa-fw"></i> <span>Logout</span> </a>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <!-- Top Bar -->
+        <div class="top-bar">
+            <button class="btn btn-sm btn-outline-secondary" id="sidebarToggle" aria-label="Toggle sidebar"> <i class="fas fa-bars"></i> </button>
+            <div class="dropdown">
+                <a class="btn btn-link dropdown-toggle text-decoration-none text-muted" href="#" role="button" id="userDropdownLink" data-bs-toggle="dropdown" aria-expanded="false">
+                    <img src="<?php echo !empty($currentUser['profile_picture']) ? htmlspecialchars($currentUser['profile_picture']) : 'assets/images/default-avatar.png'; ?>" class="rounded-circle me-1" width="30" height="30" alt="Profile">
+                    <span class="d-none d-md-inline-block"><?php echo htmlspecialchars($currentUser['username']); ?></span> <i class="fas fa-chevron-down fa-xs ms-1"></i>
+                </a>
+                <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdownLink">
+                    <li><a class="dropdown-item" href="profile.php"><i class="fas fa-user-circle fa-fw me-2 text-muted"></i> Profile</a></li>
+                    <li><a class="dropdown-item" href="settings.php"><i class="fas fa-cog fa-fw me-2 text-muted"></i> Settings</a></li>
+                    <li><hr class="dropdown-divider"></li>
+                    <li><a class="dropdown-item" href="logout.php"><i class="fas fa-sign-out-alt fa-fw me-2 text-muted"></i> Logout</a></li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Page Header -->
+        <div class="page-header">
+             <h2><i class="fas fa-edit me-2"></i> Edit Article</h2>
+            <p>Update the content and settings for this article.</p>
+             <div class="header-meta">
+                 User: <?php echo htmlspecialchars($currentUser['username']); ?> | UTC: <?php echo $headerUtcTime; ?>
+             </div>
+        </div>
+
+         <!-- Message Area -->
+        <?php if (!empty($message)): ?>
+        <div class="alert alert-<?php echo $messageType === 'success' ? 'success' : 'danger'; ?> alert-dismissible fade show" role="alert">
+            <?php echo htmlspecialchars($message); ?>
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+        <?php endif; ?>
+
+        <?php if ($article): // Only show form if article was loaded ?>
+        <form method="POST" action="article-edit.php?id=<?php echo $articleId; /* Keep ID in action URL */ ?>" enctype="multipart/form-data" id="articleForm">
+            <input type="hidden" name="article_id" value="<?php echo $articleId; ?>"> <!-- Hidden field for ID -->
+            <div class="row">
+                <!-- Main Content Column -->
+                <div class="col-lg-8 order-lg-1">
+                    <!-- Title Card -->
+                    <div class="card mb-4">
+                        <div class="card-body">
+                            <div class="mb-3">
+                                <label for="title" class="form-label">Title <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control form-control-lg" id="title" name="title" value="<?php echo htmlspecialchars($article['title']); ?>" required>
+                            </div>
+                             <div class="mb-3">
+                                <label for="slug" class="form-label">Slug</label>
+                                <input type="text" class="form-control form-control-sm" id="slug" name="slug" value="<?php echo htmlspecialchars($article['slug']); ?>">
+                                <small class="form-text text-muted">URL identifier. Changing this may affect existing links.</small>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Content Editor Card -->
+                     <div class="card mb-4">
+                        <div class="card-header"> <h5 class="mb-0">Content <span class="text-danger">*</span></h5> </div>
+                        <div class="card-body p-0">
+                            <div id="editor-container"><?php echo $article['content']; ?></div>
+                            <input type="hidden" name="content" id="content">
+                        </div>
+                         <div class="card-footer"> <small class="form-text text-muted">Edit the article content.</small> </div>
+                    </div>
+                    <!-- Excerpt Card -->
+                    <div class="card mb-4">
+                         <div class="card-header"> <h5 class="mb-0">Excerpt</h5> </div>
+                         <div class="card-body">
+                            <textarea class="form-control form-control-sm" id="excerpt" name="excerpt" rows="3"><?php echo htmlspecialchars($article['excerpt']); ?></textarea>
+                            <small class="form-text text-muted">A brief summary.</small>
+                         </div>
+                    </div>
+                    <!-- Featured Image Card -->
+                    <div class="card mb-4">
+                        <div class="card-header"> <h5 class="mb-0">Featured Image</h5> </div>
+                        <div class="card-body">
+                            <label for="featured_image" class="form-label">Upload New Image</label>
+                            <input type="file" class="form-control form-control-sm" id="featured_image" name="featured_image" accept="image/jpeg,image/png,image/gif,image/webp">
+                            <small class="form-text text-muted mb-2">Optional: Replace current image. Max: 5MB.</small>
+                            <div class="preview-img-container">
+                                <?php if (!empty($article['featured_image']) && file_exists($article['featured_image'])): ?>
+                                    <span class="current-img-label">Current Image:</span>
+                                    <img id="current_image_preview" src="<?php echo htmlspecialchars($article['featured_image']); ?>?t=<?php echo time(); // Cache buster ?>" alt="Current Featured Image" class="preview-img" style="display: block;">
+                                <?php endif; ?>
+                                <img id="new_image_preview" src="#" alt="New Image Preview" class="preview-img">
+                                <!-- Add remove image checkbox if desired -->
+                                <!-- <div class="form-check mt-2"> <input class="form-check-input" type="checkbox" name="remove_featured_image" value="1" id="remove_featured_image"> <label class="form-check-label small" for="remove_featured_image"> Remove featured image </label> </div> -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sidebar Column -->
+                <div class="col-lg-4 order-lg-2">
+                    <!-- Publish Card -->
+                    <div class="card mb-4 publish-card">
+                        <div class="card-header"> <h5 class="mb-0">Publish Settings</h5> </div>
+                        <div class="card-body">
+                            <div class="mb-3">
+                                <label for="status" class="form-label">Status</label>
+                                <select class="form-select form-select-sm" id="status" name="status">
+                                    <option value="draft" <?php echo $article['status'] === 'draft' ? 'selected' : ''; ?>>Draft</option>
+                                    <option value="pending" <?php echo $article['status'] === 'pending' ? 'selected' : ''; ?>>Pending Review</option>
+                                    <?php if (hasPermission('publish_article')): ?>
+                                    <option value="published" <?php echo $article['status'] === 'published' ? 'selected' : ''; ?>>Published</option>
+                                    <?php endif; ?>
+                                    <option value="archived" <?php echo $article['status'] === 'archived' ? 'selected' : ''; ?>>Archived</option> <!-- Added Archived -->
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label for="visibility" class="form-label">Visibility</label>
+                                <select class="form-select form-select-sm" id="visibility" name="visibility">
+                                    <option value="public" <?php echo $article['visibility'] === 'public' ? 'selected' : ''; ?>>Public</option>
+                                    <option value="private" <?php echo $article['visibility'] === 'private' ? 'selected' : ''; ?>>Private</option>
+                                    <option value="password_protected" <?php echo $article['visibility'] === 'password_protected' ? 'selected' : ''; ?>>Password Protected</option>
+                                </select>
+                            </div>
+                            <div id="password_field" class="visibility-options mb-3 <?php echo $article['visibility'] === 'password_protected' ? 'show' : ''; ?>">
+                                <label for="password" class="form-label">Password</label>
+                                <input type="password" class="form-control form-control-sm" id="password" name="password" value="<?php echo htmlspecialchars($article['password']); ?>" placeholder="Enter password">
+                            </div>
+                            <hr>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="featured" name="featured" value="1" <?php echo $article['featured'] ? 'checked' : ''; ?>>
+                                <label class="form-check-label small" for="featured">Featured Article</label>
+                            </div>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="breaking_news" name="breaking_news" value="1" <?php echo $article['breaking_news'] ? 'checked' : ''; ?>>
+                                <label class="form-check-label small" for="breaking_news">Breaking News</label>
+                            </div>
+                            <div class="action-buttons">
+                                <div class="d-grid">
+                                     <button type="submit" name="update" class="btn btn-primary btn-sm"><i class="fas fa-sync-alt me-1"></i> Update Article</button>
+                                </div>
+                                <div class="d-flex justify-content-between mt-2">
+                                    <button type="submit" name="save_and_continue" class="btn btn-outline-primary btn-sm flex-grow-1 me-1"><i class="fas fa-edit fa-xs"></i> Update & Continue</button>
+                                    <a href="articles.php" class="btn btn-outline-secondary btn-sm flex-grow-1 ms-1"><i class="fas fa-list fa-xs"></i> View List</a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Categories Card -->
+                    <div class="card mb-4">
+                        <div class="card-header"> <h5 class="mb-0">Categories</h5> </div>
+                        <div class="card-body">
+                            <?php if (!empty($categories)): ?>
+                                <div class="multi-select-container">
+                                    <?php foreach ($categories as $category): ?>
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="checkbox" name="categories[]" value="<?php echo $category['id']; ?>" id="cat_<?php echo $category['id']; ?>"
+                                                <?php echo in_array($category['id'], $article['selected_categories']) ? 'checked' : ''; ?>>
+                                            <label class="form-check-label small" for="cat_<?php echo $category['id']; ?>">
+                                                <?php echo htmlspecialchars($category['name']); ?>
+                                            </label>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php else: ?> <p class="text-muted text-center small mb-0">No categories available.</p> <?php endif; ?>
+                        </div>
+                    </div>
+                    <!-- Tags Card -->
+                    <div class="card mb-4">
+                         <div class="card-header"> <h5 class="mb-0">Tags</h5> </div>
+                        <div class="card-body">
+                            <?php if (!empty($tags)): ?>
+                                <div class="multi-select-container">
+                                     <?php foreach ($tags as $tag): ?>
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="checkbox" name="tags[]" value="<?php echo $tag['id']; ?>" id="tag_<?php echo $tag['id']; ?>"
+                                                <?php echo in_array($tag['id'], $article['selected_tags']) ? 'checked' : ''; ?>>
+                                            <label class="form-check-label small" for="tag_<?php echo $tag['id']; ?>">
+                                                <?php echo htmlspecialchars($tag['name']); ?>
+                                            </label>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php else: ?> <p class="text-muted text-center small mb-0">No tags available.</p> <?php endif; ?>
+                        </div>
+                    </div>
+                </div> <!-- End Sidebar Column -->
+            </div> <!-- End Row -->
+        </form>
+        <?php else: // Show error if article couldn't be loaded ?>
+            <div class="alert alert-danger">Could not load article data. Please check the ID or contact support.</div>
+            <a href="articles.php" class="btn btn-secondary">Back to Articles List</a>
+        <?php endif; ?>
+
+        <!-- Footer -->
+        <footer class="mt-4 mb-3 text-center text-muted small">
+            Copyright &copy; <?php echo htmlspecialchars(SITE_NAME) . ' ' . date('Y'); ?>
+        </footer>
+    </div> <!-- End Main Content -->
+
+    <!-- Core JavaScript -->
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous" defer></script>
+    <script src="https://cdn.quilljs.com/1.3.7/quill.min.js" defer></script>
+
+    <script defer>
+        document.addEventListener('DOMContentLoaded', function() {
+
+            // --- Sidebar Toggle ---
+            const sidebar = document.querySelector('.sidebar');
+            const mainContent = document.querySelector('.main-content');
+            const sidebarToggle = document.getElementById('sidebarToggle');
+            const SIDEBAR_COLLAPSED_KEY = 'sidebarCollapsed';
+            function applySidebarState(collapsed) { if (sidebar && mainContent) { sidebar.classList.toggle('collapsed', collapsed); mainContent.classList.toggle('expanded', collapsed); } }
+            const isCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
+            applySidebarState(isCollapsed);
+            if (sidebarToggle) { sidebarToggle.addEventListener('click', function() { const shouldCollapse = !sidebar.classList.contains('collapsed'); applySidebarState(shouldCollapse); localStorage.setItem(SIDEBAR_COLLAPSED_KEY, shouldCollapse); }); }
+
+            // --- Quill Editor Initialization ---
+            let quill = null;
+            const editorContainer = document.getElementById('editor-container');
+            if (editorContainer) {
+                 quill = new Quill('#editor-container', {
+                    theme: 'snow',
+                    modules: { toolbar: [ [{ 'header': [1, 2, 3, false] }], ['bold', 'italic', 'underline', 'link'], [{ 'list': 'ordered'}, { 'list': 'bullet' }], ['blockquote', 'code-block'], ['image', 'video'], ['clean'] ] },
+                    placeholder: 'Start writing...',
+                });
+                 // Load existing content (already outputted raw HTML via PHP)
+            }
+
+            // --- Form Submission Handling ---
+            const articleForm = document.getElementById('articleForm');
+            if (articleForm) {
+                articleForm.addEventListener('submit', function(e) {
+                    const contentInput = document.getElementById('content');
+                    if (quill && contentInput) contentInput.value = quill.root.innerHTML;
+                    // Basic Validation
+                    if (!document.getElementById('title').value.trim()) { e.preventDefault(); alert('Article title is required.'); return; }
+                    if (quill && quill.getText().trim().length < 1) { e.preventDefault(); alert('Article content cannot be empty.'); return; }
+                    const visibility = document.getElementById('visibility').value;
+                    if (visibility === 'password_protected' && !document.getElementById('password').value.trim()) { e.preventDefault(); alert('Password is required.'); return; }
+                });
+            }
+
+            // --- Slug Generation (Only if slug field is manually cleared) ---
+            const titleInput = document.getElementById('title');
+            const slugInput = document.getElementById('slug');
+            if (titleInput && slugInput) {
+                slugInput.addEventListener('input', function() {
+                   // Mark that user is manually editing slug, maybe disable auto-generation on blur
+                   slugInput.dataset.manualEdit = 'true';
+                });
+                titleInput.addEventListener('blur', function() {
+                    // Only auto-generate if slug is empty AND user hasn't manually edited it
+                    if (slugInput.value.trim() === '' && !slugInput.dataset.manualEdit) {
+                        const titleValue = this.value.trim();
+                        if (titleValue) {
+                            slugInput.value = titleValue.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '').replace(/--+/g, '-').replace(/^-+/, '').replace(/-+$/, '');
+                        }
+                    }
+                });
+            }
+
+            // --- Visibility Toggle ---
+            const visibilitySelect = document.getElementById('visibility');
+            const passwordField = document.getElementById('password_field');
+            if (visibilitySelect && passwordField) {
+                visibilitySelect.addEventListener('change', function() {
+                    passwordField.classList.toggle('show', this.value === 'password_protected');
+                });
+            }
+
+            // --- Image Preview (Handles both current and new) ---
+            const imageInput = document.getElementById('featured_image');
+            const newPreview = document.getElementById('new_image_preview');
+            const currentPreview = document.getElementById('current_image_preview'); // Get current preview element
+            if (imageInput && newPreview) {
+                imageInput.addEventListener('change', function(e) {
+                    const file = e.target.files[0];
+                    if (file && file.type.startsWith('image/')) {
+                        const reader = new FileReader();
+                        reader.onload = function(event) {
+                            newPreview.src = event.target.result;
+                            newPreview.style.display = 'block'; // Show new preview
+                            if(currentPreview) currentPreview.style.display = 'none'; // Hide current preview if new one is selected
+                        }
+                        reader.readAsDataURL(file);
+                    } else {
+                        newPreview.src = '#';
+                        newPreview.style.display = 'none'; // Hide new preview
+                        if(currentPreview) currentPreview.style.display = 'block'; // Show current preview again if selection cleared/invalid
+                    }
+                });
+            }
+
+        }); // End DOMContentLoaded
+    </script>
+
+</body>
+</html>
