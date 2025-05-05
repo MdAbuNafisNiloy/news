@@ -1,9 +1,9 @@
 <?php
 // Database configuration
-define('DB_HOST', 'localhost');
-define('DB_USER', 'admin_alphanews'); // Change to your MySQL username
-define('DB_PASS', 'Niloynafis234@'); // Change to your MySQL password
-define('DB_NAME', 'admin_alphanews'); // Database name
+define('DB_HOST', 'panel.alphasoft.world');  // Your Plesk server's IP or domain name
+define('DB_USER', 'admin_alphanews');         // Your MySQL username
+define('DB_PASS', 'Niloynafis234@');         // Your MySQL password
+define('DB_NAME', 'admin_alphanews');         // Database name
 
 // Create connection
 try {
@@ -14,3 +14,4 @@ try {
 } catch (PDOException $e) {
     die("Connection failed: " . $e->getMessage());
 }
+?>

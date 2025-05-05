@@ -1,0 +1,17 @@
+RewriteEngine On
+
+# Ensure the request isn't for a file or directory that exists
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Rewrite everything to index.php and pass the URL as a query parameter
+RewriteRule ^(.*)$ index.php?url=$1 [QSA,L]
+
+# Optionally: Add security to prevent access to sensitive files (like .htaccess itself)
+<Files .htaccess>
+    Order Allow,Deny
+    Deny from all
+</Files>
+
+# Optional: Disable directory browsing
+Options -Indexes
